@@ -65,12 +65,14 @@ class GpuProfile:
 
 
 SUPPORTED_CONSUMER_CAPABILITIES = {
+    (6, 1): "pascal",   # GTX 1080 Ti / 1080 / 1070 / 1060 (GP10x)
     (7, 5): "turing",
     (8, 6): "ampere",
     (8, 9): "ada",
     (12, 0): "blackwell",
 }
 MIN_SUPPORTED_VRAM_GB_BY_ARCH = {
+    "pascal": 8.0,   # GTX 1080 Ti has 11 GB — comfortably above this floor
     "turing": 8.0,
     "ampere": 10.0,
     "ada": 10.0,
@@ -101,6 +103,10 @@ def _get_gpu_peak_flops(gpu_name):
         ("5070", 150.0e12),
         ("5060 ti", 120.0e12),
         ("4060 ti", 88.4e12),
+        ("1080 ti", 11.3e12),    # GTX 1080 Ti  ~11.3 TFLOPS FP32 (Pascal GP102)
+        ("1080",     8.9e12),    # GTX 1080     ~8.9  TFLOPS FP32
+        ("1070",     6.5e12),    # GTX 1070     ~6.5  TFLOPS FP32
+        ("1060",     4.4e12),    # GTX 1060     ~4.4  TFLOPS FP32
         ("2080 ti", 107.5e12),
         ("2080 super", 89.6e12),
         ("2080", 80.3e12),
@@ -126,15 +132,28 @@ def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
     arch = SUPPORTED_CONSUMER_CAPABILITIES.get(capability)
     min_vram_gb = MIN_SUPPORTED_VRAM_GB_BY_ARCH.get(arch, float("inf"))
     is_rtx = "rtx" in name
+    is_gtx = "gtx" in name          # Pascal and older use GTX branding, not RTX
     is_laptop = "laptop" in name
     supported_consumer = (
-        is_rtx
+        (is_rtx or is_gtx)
         and not is_laptop
         and arch is not None
         and gpu_vram_gb >= (min_vram_gb - VRAM_FLOOR_TOLERANCE_GB)
     )
 
     if supported_consumer:
+        # Pascal (GTX 1080 Ti etc.) — no BF16, no Tensor Cores, no Triton.
+        # 1080 Ti has 11 GB GDDR5X; use conservative batch ordering + checkpointing.
+        if arch == "pascal":
+            return GpuProfile(
+                name="pascal-11gb",
+                is_supported_consumer=True,
+                is_compatibility_only=False,
+                train_batch_candidates=(1, 2, 4, 8, 16),
+                checkpoint_modes=(True,),
+                default_checkpointing=True,
+                eval_batch_cap=8,
+            )
         if arch == "turing" and gpu_vram_gb < 12.0:
             return GpuProfile(
                 name=f"{arch}-8-11gb",
@@ -187,7 +206,7 @@ def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
 def _compatibility_warning(gpu_name, capability, gpu_vram_gb):
     name = gpu_name.lower()
     arch = SUPPORTED_CONSUMER_CAPABILITIES.get(capability)
-    if "rtx" not in name:
+    if "rtx" not in name and "gtx" not in name:
         return None
     if "laptop" in name:
         return "laptop GPUs are outside the supported desktop matrix"
@@ -274,6 +293,12 @@ def detect_runtime():
     torch.backends.cuda.matmul.allow_tf32 = tf32_enabled
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.allow_tf32 = tf32_enabled
+
+    # On Pascal (CC < 7.0) torch.compile/Triton is unavailable; enable cuDNN
+    # auto-tuning as a partial substitute for fixed-size workloads.
+    if gpu_cc[0] < 7 and hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = True
+        print("cuDNN benchmark mode enabled for Pascal GPU.")
 
     use_compile = False
     print("torch.compile disabled in this fork runtime path.")
@@ -917,6 +942,9 @@ def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size,
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
+        # GradScaler is required for stable FP16 training on Pascal (CC < 7.0),
+        # which has no BF16 and relies on float16 AMP without loss scaling by default.
+        scaler = torch.cuda.amp.GradScaler() if runtime.amp_dtype == torch.float16 else None
         total_steps = AUTOTUNE_WARMUP_STEPS + AUTOTUNE_MEASURE_STEPS
         measured_time = 0.0
         for step_idx in range(total_steps):
@@ -925,9 +953,15 @@ def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size,
             for _ in range(grad_accum_steps):
                 with autocast_ctx:
                     loss = model(x, y)
-                (loss / grad_accum_steps).backward()
+                scaled = scaler.scale(loss / grad_accum_steps) if scaler is not None else (loss / grad_accum_steps)
+                scaled.backward()
                 x, y, _ = next(train_loader)
-            optimizer.step()
+            if scaler is not None:
+                scaler.unscale_(optimizer)   # MuonAdamW reads .grad directly; unscale first
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             model.zero_grad(set_to_none=True)
             torch.cuda.synchronize()
             dt = time.time() - t0
@@ -1084,6 +1118,9 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
     )
     model = _maybe_compile(model, dynamic=False)
 
+    # GradScaler for FP16 AMP (Pascal and older GPUs that lack BF16).
+    scaler = torch.cuda.amp.GradScaler() if runtime.amp_dtype == torch.float16 else None
+
     train_loader = make_dataloader(
         tokenizer,
         device_batch_size,
@@ -1127,7 +1164,10 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
                 loss = model(x, y)
             train_loss = loss.detach()
             loss = loss / grad_accum_steps
-            loss.backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             x, y, epoch = next(train_loader)
 
         progress = min(total_training_time / max(target_training_seconds, 1e-6), 1.0)
@@ -1139,7 +1179,12 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
             if group["kind"] == "muon":
                 group["momentum"] = muon_momentum
                 group["weight_decay"] = muon_weight_decay
-        optimizer.step()
+        if scaler is not None:
+            scaler.unscale_(optimizer)   # MuonAdamW reads .grad directly; unscale first
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         model.zero_grad(set_to_none=True)
 
         train_loss_f = train_loss.item()
